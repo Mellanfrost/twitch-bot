@@ -41,7 +41,7 @@ class EventListener():
                 }
             }
             response = requests.post(url, headers=headers, json=subscription_data)
-            if not response.ok:
+            if response.status_code != 202:
                 raise ValueError(f"Subscription request failed for {event["type"]} with status {response.status_code}")
 
     async def on_event(self, event_str):
