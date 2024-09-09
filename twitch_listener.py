@@ -4,55 +4,64 @@ import requests
 import websockets
 
 
-class ChatListener():
+class EventListener():
     def __init__(self, access_token, client_id, user_id, broadcaster_id):
         self.access_token = access_token
         self.client_id = client_id
         self.user_id = user_id
         self.broadcaster_id = broadcaster_id
 
-        self.listeners = []
+        self.channel_chat_message = []
+        self.channel_follow = []
 
 
-    async def add_subscription(self, session_id):
-        subscription_data = {
-            "type": "channel.chat.message",
-            "version": "1",
-            "condition": {
-                "broadcaster_user_id": self.broadcaster_id,
-                "user_id": self.user_id,
-            },
-            "transport": {
-                "method": "websocket",
-                "session_id": f"{session_id}",
+    async def setup_subscriptions(self, session_id):
+        events = [
+            {"attribute": "channel_chat_message", "type": "channel.chat.message", "version": "1", "condition": {"broadcaster_user_id": self.broadcaster_id, "user_id": self.user_id}},
+            {"attribute": "channel_follow", "type": "channel.follow", "version": "2", "condition": {"broadcaster_user_id": self.broadcaster_id, "moderator_user_id": self.user_id}},
+        ]
+
+
+        for event in events:
+            if not getattr(self, event["attribute"], None):
+                continue
+
+            subscription_data = {
+                "type": event["type"],
+                "version": event["version"],
+                "condition": event["condition"],
+                "transport": {
+                    "method": "websocket",
+                    "session_id": session_id,
+                }
             }
-        }
 
-        response = requests.post(
-            "https://api.twitch.tv/helix/eventsub/subscriptions",
-            headers={
-                "Authorization": f"Bearer {self.access_token}", 
-                "Client-Id": self.client_id, 
-                "Content-Type": "application/json",
-                "Accept": "application/vnd.twitchtv.v5+json"
-            },
-            data=json.dumps(subscription_data)
-        )
+            response = requests.post(
+                "https://api.twitch.tv/helix/eventsub/subscriptions",
+                headers={
+                    "Authorization": f"Bearer {self.access_token}", 
+                    "Client-Id": self.client_id, 
+                    "Content-Type": "application/json",
+                    "Accept": "application/vnd.twitchtv.v5+json"
+                },
+                data=json.dumps(subscription_data)
+            )
 
-        if not response.ok:
-            raise ValueError(f"Subscription request failed with status {response.status_code}")
+            if not response.ok:
+                raise ValueError(f"Subscription request failed for {event["type"]} with status {response.status_code}")
 
 
-    async def on_message(self, message):
-        event = json.loads(message)
+    async def on_event(self, event_str):
+        event = json.loads(event_str)
         event_type = event["metadata"]["message_type"]
 
         if event_type == "session_welcome":
             session_id = event["payload"]["session"]["id"]
-            await self.add_subscription(session_id)
+            await self.setup_subscriptions(session_id)
 
         elif event_type == "notification":
-            for listener in self.listeners:
+            notification_type = event["payload"]["subscription"]["type"].replace(".", "_")
+            for listener in getattr(self, notification_type, None):
                 asyncio.create_task(listener(event))
 
         elif event_type == "session_keepalive":
@@ -64,9 +73,8 @@ class ChatListener():
 
     async def run_async(self):
         async with websockets.connect("wss://eventsub.wss.twitch.tv/ws") as websocket:
-            self.websocket = websocket
-            async for message_batch in self.websocket:
-                await self.on_message(message_batch)
+            async for event in websocket:
+                await self.on_event(event)
 
 
     def run(self):
