@@ -21,6 +21,14 @@ class EventListener():
             {"attribute": "channel_follow", "type": "channel.follow", "version": "2", "condition": {"broadcaster_user_id": self.broadcaster_id, "moderator_user_id": self.user_id}},
         ]
 
+        url = "https://api.twitch.tv/helix/eventsub/subscriptions"
+
+        headers = {
+            "Authorization": f"Bearer {self.access_token}", 
+            "Client-Id": self.client_id, 
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.twitchtv.v5+json"
+        }
 
         for event in events:
             if not getattr(self, event["attribute"], None):
@@ -36,17 +44,7 @@ class EventListener():
                 }
             }
 
-            response = requests.post(
-                "https://api.twitch.tv/helix/eventsub/subscriptions",
-                headers={
-                    "Authorization": f"Bearer {self.access_token}", 
-                    "Client-Id": self.client_id, 
-                    "Content-Type": "application/json",
-                    "Accept": "application/vnd.twitchtv.v5+json"
-                },
-                data=json.dumps(subscription_data)
-            )
-
+            response = requests.post(url, headers=headers, json=subscription_data)
             if not response.ok:
                 raise ValueError(f"Subscription request failed for {event["type"]} with status {response.status_code}")
 
