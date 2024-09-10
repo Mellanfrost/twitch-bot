@@ -1,10 +1,10 @@
 import asyncio
+import json
 import os
 
 import requests
+import websockets
 from dotenv import load_dotenv
-
-from twitch_listener import EventListener
 
 load_dotenv(override=True)
 
@@ -23,12 +23,8 @@ class TwitchBot():
         else:
             self.broadcaster_id = self.username_to_id(broadcaster_username)
 
-        self.events = EventListener(
-            access_token = self.access_token,
-            client_id = self.client_id,
-            user_id = self.user_id,
-            broadcaster_id = self.broadcaster_id,
-        )
+        self.channel_chat_message = []
+        self.channel_follow = []
 
     async def send_message(self, message):
         """
@@ -67,9 +63,57 @@ class TwitchBot():
         user_id = data["data"][0]["id"]
         return user_id
 
+    async def setup_event_subscriptions(self, session_id):
+        events = [
+            {"attribute": "channel_chat_message", "type": "channel.chat.message", "version": "1", "condition": {"broadcaster_user_id": self.broadcaster_id, "user_id": self.user_id}},
+            {"attribute": "channel_follow", "type": "channel.follow", "version": "2", "condition": {"broadcaster_user_id": self.broadcaster_id, "moderator_user_id": self.user_id}},
+        ]
+        url = "https://api.twitch.tv/helix/eventsub/subscriptions"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}", 
+            "Client-Id": self.client_id, 
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.twitchtv.v5+json"
+        }
+        for event in events:
+            if not getattr(self, event["attribute"], None):
+                continue
+            subscription_data = {
+                "type": event["type"],
+                "version": event["version"],
+                "condition": event["condition"],
+                "transport": {
+                    "method": "websocket",
+                    "session_id": session_id,
+                }
+            }
+            response = requests.post(url, headers=headers, json=subscription_data)
+            if response.status_code != 202:
+                raise ValueError(f"Subscription request failed for {event["type"]} with status {response.status_code}")
+
+    async def on_event(self, event_str):
+        event = json.loads(event_str)
+        event_type = event["metadata"]["message_type"]
+        if event_type == "session_welcome":
+            session_id = event["payload"]["session"]["id"]
+            await self.setup_event_subscriptions(session_id)
+        elif event_type == "notification":
+            notification_type = event["payload"]["subscription"]["type"].replace(".", "_")
+            for listener in getattr(self, notification_type, None):
+                asyncio.create_task(listener(event))
+        elif event_type == "session_keepalive":
+            pass
+        else:
+            print(f"Unhandled event:\n{event}")
+
+    async def run_event_listener(self):
+        async with websockets.connect("wss://eventsub.wss.twitch.tv/ws") as websocket:
+            async for event in websocket:
+                await self.on_event(event)
+
     async def run_async(self):
         tasks = []
-        tasks.append(asyncio.create_task(self.events.run_async()))
+        tasks.append(asyncio.create_task(self.run_event_listener()))
         await asyncio.gather(*tasks)
 
     def run(self):
