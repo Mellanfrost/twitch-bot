@@ -1,30 +1,150 @@
 import asyncio
 import json
 import os
+import secrets
+import urllib.parse
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import dotenv
 import requests
 import websockets
-from dotenv import load_dotenv
 
-load_dotenv(override=True)
+dotenv.load_dotenv(override=True)
 
+
+class UnauthorizedError(Exception):
+    """Error for 401 status code on requests -> access token is either expired, does not have the correct scopes, or is invalid"""
+    pass
 
 class TwitchBot():
-    def __init__(self, username:str, broadcaster_username:str):
-        self.access_token = os.getenv("ACCESS_TOKEN")
+    def __init__(self, username:str, broadcaster_username:str, browser_path=None, port=3000):
         self.client_id = os.getenv("CLIENT_ID")
+        self.client_secret = os.getenv("CLIENT_SECRET")
+        self.access_token = os.getenv("ACCESS_TOKEN") # = None if not set -> will be generated when running bot
+        self.refresh_token = os.getenv("REFRESH_TOKEN")
 
         self.broadcaster_username = broadcaster_username
         self.username = username
+        self.broadcaster_id = None
+        self.user_id = None
 
-        self.user_id = self.username_to_id(username)
-        if broadcaster_username == username:
-            self.broadcaster_id = self.user_id
-        else:
-            self.broadcaster_id = self.username_to_id(broadcaster_username)
+        self.browser_path = browser_path
+        self.port = port
 
         self.channel_chat_message = []
         self.channel_follow = []
+
+        self.scopes = [
+            "user:read:chat",
+            "user:bot",
+            "channel:bot",
+            "user:write:chat",
+            "moderator:read:followers",
+        ]
+
+    def generate_access_token(self):
+        scope = " ".join(self.scopes)
+        expected_state = secrets.token_urlsafe(32)
+        authorization_url = (
+            f"https://id.twitch.tv/oauth2/authorize"
+            f"?response_type=code"
+            f"&client_id={self.client_id}"
+            f"&redirect_uri=http://localhost:{self.port}"
+            f"&scope={scope}"
+            f"&state={expected_state}"
+        )
+
+        class TwitchRedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                parsed_url = urllib.parse.urlparse(self.path)
+                query_params = urllib.parse.parse_qs(parsed_url.query)
+
+                state = query_params.get("state", [None])[0]
+                if state != expected_state:
+                    raise ValueError("Invalid state parameter - does not match original state")
+
+                code = query_params.get("code", [None])[0]
+                self.server.code = code
+
+        server_address = ("", self.port)
+        httpd = HTTPServer(server_address, TwitchRedirectHandler)
+        if self.browser_path:
+            webbrowser.register("specified_browser", None, webbrowser.BackgroundBrowser(self.browser_path))
+            webbrowser.get("specified_browser").open(authorization_url)
+        else:
+            webbrowser.open(authorization_url)
+        httpd.handle_request()
+        code = httpd.code
+
+        token_url = "https://id.twitch.tv/oauth2/token"
+        payload = {
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": f"http://localhost:{self.port}"
+        }
+        response = requests.post(token_url, data=payload)
+        if response.status_code == 401:
+            raise UnauthorizedError()
+        response_data = response.json()
+        access_token = response_data.get("access_token")
+        refresh_token = response_data.get("refresh_token")
+
+        if not self.valid_access_token(access_token):
+            raise ValueError(f"Failed to generate a valid token: {access_token}")
+        
+        dotenv_path = dotenv.find_dotenv()
+        dotenv.set_key(dotenv_path, "ACCESS_TOKEN", access_token)
+        dotenv.set_key(dotenv_path, "REFRESH_TOKEN", refresh_token)
+
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+
+    def refresh_access_token(self):
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        data = {
+            "grant_type": "refresh_token",
+            "refresh_token": self.refresh_token,
+            "client_id": self.client_id,
+            "client_secret": self.client_secret
+        }
+        response = requests.post("https://id.twitch.tv/oauth2/token", headers=headers, data=data)
+        if response.status_code == 401:
+            raise UnauthorizedError()
+        elif response.status_code != 200:
+            raise ValueError()
+        response_data = response.json()
+        access_token = response_data.get("access_token")
+        refresh_token = response_data.get("refresh_token")
+
+        if not self.valid_access_token(access_token):
+            raise ValueError()
+        
+        dotenv_path = dotenv.find_dotenv()
+        dotenv.set_key(dotenv_path, "ACCESS_TOKEN", access_token)
+        dotenv.set_key(dotenv_path, "REFRESH_TOKEN", refresh_token)
+
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+
+    def valid_access_token(self, access_token, raise_on_fail=False):
+        headers = {"Authorization": f"OAuth {access_token}"}
+        response = requests.get("https://id.twitch.tv/oauth2/validate", headers=headers)
+        if response.status_code == 200:
+            return True
+        if not raise_on_fail:
+            return False
+        elif response.status_code == 401:
+            raise UnauthorizedError()
+        else:
+            raise ValueError()
 
     async def send_message(self, message):
         """
@@ -43,6 +163,8 @@ class TwitchBot():
             "message": message
         }
         response = requests.post(url, headers=headers, json=data)
+        if response.status_code == 401:
+            raise UnauthorizedError()
         if response.status_code != 200:
             raise ValueError(f"Send message request failed for {message} with status {response.status_code}")
 
@@ -57,10 +179,12 @@ class TwitchBot():
             "Client-Id": self.client_id
         }
         response = requests.get(url, headers=headers)
+        if response.status_code == 401:
+            raise UnauthorizedError()
         if response.status_code != 200:
             raise ValueError(f"User ID request failed for {username} with status {response.status_code}")
-        data = response.json()
-        user_id = data["data"][0]["id"]
+        response_data = response.json()
+        user_id = response_data["data"][0]["id"]
         return user_id
 
     async def setup_event_subscriptions(self, session_id):
@@ -88,6 +212,8 @@ class TwitchBot():
                 }
             }
             response = requests.post(url, headers=headers, json=subscription_data)
+            if response.status_code == 401:
+                raise UnauthorizedError()
             if response.status_code != 202:
                 raise ValueError(f"Subscription request failed for {event["type"]} with status {response.status_code}")
 
@@ -111,10 +237,45 @@ class TwitchBot():
             async for event in websocket:
                 await self.on_event(event)
 
+
+    def update_access_token(self):
+        print("Access token failed, attempting to update...")
+        try:
+            self.refresh_access_token()
+            print("Refreshed access token")
+        except:
+            try:
+                self.generate_access_token()
+                print("Generated new access token")
+            except:
+                raise ValueError("Failed to generate valid access token")
+
     async def run_async(self):
+        if not self.valid_access_token(self.access_token):
+            self.update_access_token()
+
+        if not self.user_id:
+            self.user_id = self.username_to_id(self.username)
+        if not self.broadcaster_id:
+            if self.broadcaster_username == self.username:
+                self.broadcaster_id = self.user_id
+            else:
+                self.broadcaster_id = self.username_to_id(self.broadcaster_username)
+        
         tasks = []
         tasks.append(asyncio.create_task(self.run_event_listener()))
-        await asyncio.gather(*tasks)
+
+        while True:
+            try:
+                self.valid_access_token(self.access_token, raise_on_fail=True)
+                print("Got a valid access token, running bot...")
+                await asyncio.gather(*tasks)
+
+            except UnauthorizedError:
+                self.update_access_token()
+            except asyncio.CancelledError:
+                print("Exited")
+                break
 
     def run(self):
         asyncio.run(self.run_async())
