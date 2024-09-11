@@ -116,8 +116,7 @@ class TwitchBot():
         refresh_token = response_data.get("refresh_token")
         token_scopes = response_data["scope"]
 
-        if not self.valid_access_token(access_token):
-            raise ValueError(f"Failed to generate a valid token: {access_token}")
+        self.valid_access_token(access_token)
         
         dotenv_path = dotenv.find_dotenv()
         dotenv.set_key(dotenv_path, "ACCESS_TOKEN", access_token)
@@ -147,10 +146,7 @@ class TwitchBot():
         refresh_token = response_data.get("refresh_token")
         token_scopes = response_data["scope"]
 
-        if not self.valid_access_token(access_token):
-            raise ValueError()
-
-        self.valid_access_token_scopes(token_scopes, raise_on_fail=True)
+        self.valid_access_token(access_token)
         
         dotenv_path = dotenv.find_dotenv()
         dotenv.set_key(dotenv_path, "ACCESS_TOKEN", access_token)
@@ -160,19 +156,15 @@ class TwitchBot():
         self.refresh_token = refresh_token
         self.token_scopes = token_scopes
 
-    def valid_access_token(self, access_token, raise_on_fail=False):
+    def valid_access_token(self, access_token):
         headers = {"Authorization": f"OAuth {access_token}"}
         response = requests.get("https://id.twitch.tv/oauth2/validate", headers=headers)
-        if response.status_code == 200:
-            return True
-        if not raise_on_fail:
-            return False
-        elif response.status_code == 401:
+        if response.status_code == 401:
             raise UnauthorizedError()
-        else:
+        if response.status_code != 200:
             raise ValueError()
-        
-    def valid_access_token_scopes(self, token_scopes, raise_on_fail=False):
+        response_data = response.json()
+        token_scopes = response_data["scopes"]
         required_scopes = set(self.default_scopes)
         for subscription in self.__dict__.values():
             if not isinstance(subscription, EventSubscription):
@@ -182,11 +174,10 @@ class TwitchBot():
             required_scopes.update(subscription.scopes)
         for scope in required_scopes:
             if scope not in token_scopes:
-                if raise_on_fail:
-                    raise UnauthorizedError("Token scopes does not match required scopes")
-                else:
-                    return False
-        return True
+                raise UnauthorizedError("Token scopes does not match required scopes")
+        if token_scopes != self.token_scopes:
+            self.token_scopes = token_scopes
+            print("Updated token scopes")
 
     async def send_message(self, message):
         """
@@ -296,8 +287,7 @@ class TwitchBot():
         tasks.append(asyncio.create_task(self.run_event_listener()))
         while True:
             try:
-                self.valid_access_token(self.access_token, raise_on_fail=True)
-                self.valid_access_token_scopes(self.token_scopes, raise_on_fail=True)
+                self.valid_access_token(self.access_token)
                 print("Got a valid access token, running bot...")
                 await asyncio.gather(*tasks)
             except UnauthorizedError:
