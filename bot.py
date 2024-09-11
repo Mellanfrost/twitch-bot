@@ -26,23 +26,19 @@ class EventSubscription:
         self.listeners = []
 
 class TwitchBot():
-    def __init__(self, username:str, broadcaster_username:str, browser_path=None, port=3000):
+    def __init__(self, user_id:str, broadcaster_id:str, browser_path=None, port=3000):
+        self.default_scopes = [
+            "user:write:chat",
+        ]
         self.client_id = os.getenv("CLIENT_ID")
         self.client_secret = os.getenv("CLIENT_SECRET")
         self.access_token = os.getenv("ACCESS_TOKEN") # = None if not set -> will be generated when running bot
         self.refresh_token = os.getenv("REFRESH_TOKEN")
+        self.token_scopes = self.default_scopes
 
-        if not self.valid_access_token(self.access_token):
-            self.update_access_token()
-
-        self.broadcaster_username = broadcaster_username
-        self.username = username
-        self.user_id = self.username_to_id(self.username)
-        if self.broadcaster_username == self.username:
-            self.broadcaster_id = self.user_id
-        else:
-            self.broadcaster_id = self.username_to_id(self.broadcaster_username)
-
+        self.user_id = user_id
+        self.broadcaster_id = broadcaster_id
+        
         self.browser_path = browser_path
         self.port = port
 
@@ -50,25 +46,25 @@ class TwitchBot():
             name="channel.chat.message",
             version="1",
             conditions={"broadcaster_user_id": self.broadcaster_id, "user_id": self.user_id},
-            scopes=[],
+            scopes=["user:read:chat", "user:bot", "channel:bot"],
         )
         self.channel_follow = EventSubscription(
             name="channel.follow",
             version="2",
             conditions={"broadcaster_user_id": self.broadcaster_id, "moderator_user_id": self.user_id},
-            scopes=[],
+            scopes=["moderator:read:followers"],
         )
 
-        self.scopes = [
-            "user:read:chat",
-            "user:bot",
-            "channel:bot",
-            "user:write:chat",
-            "moderator:read:followers",
-        ]
 
     def generate_access_token(self):
-        scope = " ".join(self.scopes)
+        active_scopes = set(self.default_scopes)
+        for subscription in self.__dict__.values():
+            if not isinstance(subscription, EventSubscription):
+                continue
+            if not subscription.listeners:
+                continue
+            active_scopes.update(subscription.scopes)
+        scope = " ".join(active_scopes)
         expected_state = secrets.token_urlsafe(32)
         authorization_url = (
             f"https://id.twitch.tv/oauth2/authorize"
@@ -118,6 +114,7 @@ class TwitchBot():
         response_data = response.json()
         access_token = response_data.get("access_token")
         refresh_token = response_data.get("refresh_token")
+        token_scopes = response_data["scope"]
 
         if not self.valid_access_token(access_token):
             raise ValueError(f"Failed to generate a valid token: {access_token}")
@@ -128,6 +125,7 @@ class TwitchBot():
 
         self.access_token = access_token
         self.refresh_token = refresh_token
+        self.token_scopes = token_scopes
 
     def refresh_access_token(self):
         headers = {
@@ -147,9 +145,12 @@ class TwitchBot():
         response_data = response.json()
         access_token = response_data.get("access_token")
         refresh_token = response_data.get("refresh_token")
+        token_scopes = response_data["scope"]
 
         if not self.valid_access_token(access_token):
             raise ValueError()
+
+        self.valid_access_token_scopes(token_scopes, raise_on_fail=True)
         
         dotenv_path = dotenv.find_dotenv()
         dotenv.set_key(dotenv_path, "ACCESS_TOKEN", access_token)
@@ -157,6 +158,7 @@ class TwitchBot():
 
         self.access_token = access_token
         self.refresh_token = refresh_token
+        self.token_scopes = token_scopes
 
     def valid_access_token(self, access_token, raise_on_fail=False):
         headers = {"Authorization": f"OAuth {access_token}"}
@@ -169,6 +171,22 @@ class TwitchBot():
             raise UnauthorizedError()
         else:
             raise ValueError()
+        
+    def valid_access_token_scopes(self, token_scopes, raise_on_fail=False):
+        required_scopes = set(self.default_scopes)
+        for subscription in self.__dict__.values():
+            if not isinstance(subscription, EventSubscription):
+                continue
+            if not subscription.listeners:
+                continue
+            required_scopes.update(subscription.scopes)
+        for scope in required_scopes:
+            if scope not in token_scopes:
+                if raise_on_fail:
+                    raise UnauthorizedError("Token scopes does not match required scopes")
+                else:
+                    return False
+        return True
 
     async def send_message(self, message):
         """
@@ -266,7 +284,7 @@ class TwitchBot():
         try:
             self.refresh_access_token()
             print("Refreshed access token")
-        except UnauthorizedError:
+        except:
             try:
                 self.generate_access_token()
                 print("Generated new access token")
@@ -274,18 +292,14 @@ class TwitchBot():
                 raise ValueError("Failed to generate valid access token")
 
     async def run_async(self):
-        if not self.valid_access_token(self.access_token):
-            self.update_access_token()
-        
         tasks = []
         tasks.append(asyncio.create_task(self.run_event_listener()))
-
         while True:
             try:
                 self.valid_access_token(self.access_token, raise_on_fail=True)
+                self.valid_access_token_scopes(self.token_scopes, raise_on_fail=True)
                 print("Got a valid access token, running bot...")
                 await asyncio.gather(*tasks)
-
             except UnauthorizedError:
                 self.update_access_token()
             except asyncio.CancelledError:
