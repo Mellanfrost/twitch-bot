@@ -17,6 +17,14 @@ class UnauthorizedError(Exception):
     """Error for 401 status code on requests -> access token is either expired, does not have the correct scopes, or is invalid"""
     pass
 
+class EventSubscription:
+    def __init__(self, name, version, conditions, scopes):
+        self.name = name
+        self.version = version
+        self.conditions = conditions
+        self.scopes = scopes
+        self.listeners = []
+
 class TwitchBot():
     def __init__(self, username:str, broadcaster_username:str, browser_path=None, port=3000):
         self.client_id = os.getenv("CLIENT_ID")
@@ -24,16 +32,32 @@ class TwitchBot():
         self.access_token = os.getenv("ACCESS_TOKEN") # = None if not set -> will be generated when running bot
         self.refresh_token = os.getenv("REFRESH_TOKEN")
 
+        if not self.valid_access_token(self.access_token):
+            self.update_access_token()
+
         self.broadcaster_username = broadcaster_username
         self.username = username
-        self.broadcaster_id = None
-        self.user_id = None
+        self.user_id = self.username_to_id(self.username)
+        if self.broadcaster_username == self.username:
+            self.broadcaster_id = self.user_id
+        else:
+            self.broadcaster_id = self.username_to_id(self.broadcaster_username)
 
         self.browser_path = browser_path
         self.port = port
 
-        self.channel_chat_message = []
-        self.channel_follow = []
+        self.channel_chat_message = EventSubscription(
+            name="channel.chat.message",
+            version="1",
+            conditions={"broadcaster_user_id": self.broadcaster_id, "user_id": self.user_id},
+            scopes=[],
+        )
+        self.channel_follow = EventSubscription(
+            name="channel.follow",
+            version="2",
+            conditions={"broadcaster_user_id": self.broadcaster_id, "moderator_user_id": self.user_id},
+            scopes=[],
+        )
 
         self.scopes = [
             "user:read:chat",
@@ -188,10 +212,6 @@ class TwitchBot():
         return user_id
 
     async def setup_event_subscriptions(self, session_id):
-        events = [
-            {"attribute": "channel_chat_message", "type": "channel.chat.message", "version": "1", "condition": {"broadcaster_user_id": self.broadcaster_id, "user_id": self.user_id}},
-            {"attribute": "channel_follow", "type": "channel.follow", "version": "2", "condition": {"broadcaster_user_id": self.broadcaster_id, "moderator_user_id": self.user_id}},
-        ]
         url = "https://api.twitch.tv/helix/eventsub/subscriptions"
         headers = {
             "Authorization": f"Bearer {self.access_token}", 
@@ -199,13 +219,15 @@ class TwitchBot():
             "Content-Type": "application/json",
             "Accept": "application/vnd.twitchtv.v5+json"
         }
-        for event in events:
-            if not getattr(self, event["attribute"], None):
+        for subscription in self.__dict__.values():
+            if not isinstance(subscription, EventSubscription):
+                continue
+            if not subscription.listeners:
                 continue
             subscription_data = {
-                "type": event["type"],
-                "version": event["version"],
-                "condition": event["condition"],
+                "type": subscription.name,
+                "version": subscription.version,
+                "condition": subscription.conditions,
                 "transport": {
                     "method": "websocket",
                     "session_id": session_id,
@@ -215,7 +237,7 @@ class TwitchBot():
             if response.status_code == 401:
                 raise UnauthorizedError()
             if response.status_code != 202:
-                raise ValueError(f"Subscription request failed for {event["type"]} with status {response.status_code}")
+                raise ValueError(f"Subscription request failed for {subscription.name} with status {response.status_code}")
 
     async def on_event(self, event_str):
         event = json.loads(event_str)
@@ -225,7 +247,8 @@ class TwitchBot():
             await self.setup_event_subscriptions(session_id)
         elif event_type == "notification":
             notification_type = event["payload"]["subscription"]["type"].replace(".", "_")
-            for listener in getattr(self, notification_type, None):
+            event_listener = getattr(self, notification_type, None)
+            for listener in event_listener.listeners:
                 asyncio.create_task(listener(event))
         elif event_type == "session_keepalive":
             pass
@@ -243,7 +266,7 @@ class TwitchBot():
         try:
             self.refresh_access_token()
             print("Refreshed access token")
-        except:
+        except UnauthorizedError:
             try:
                 self.generate_access_token()
                 print("Generated new access token")
@@ -253,14 +276,6 @@ class TwitchBot():
     async def run_async(self):
         if not self.valid_access_token(self.access_token):
             self.update_access_token()
-
-        if not self.user_id:
-            self.user_id = self.username_to_id(self.username)
-        if not self.broadcaster_id:
-            if self.broadcaster_username == self.username:
-                self.broadcaster_id = self.user_id
-            else:
-                self.broadcaster_id = self.username_to_id(self.broadcaster_username)
         
         tasks = []
         tasks.append(asyncio.create_task(self.run_event_listener()))
