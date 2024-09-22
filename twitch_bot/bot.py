@@ -7,8 +7,10 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import dotenv
+import numpy as np
 import requests
 import websockets
+from twitchrealtimehandler import TwitchAudioGrabber
 
 dotenv.load_dotenv(override=True)
 
@@ -25,6 +27,13 @@ class EventSubscription:
         self.scopes = scopes
         self.listeners = []
 
+class AudioSubscription:
+    def __init__(self, segment_duration_seconds=1, sample_rate=44100, channels=1):
+        self.segment_duration_seconds = segment_duration_seconds
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.listeners = []
+
 class TwitchBot():
     def __init__(self, user_id:str, broadcaster_id:str, browser_path=None, port=3000):
         self.default_scopes = [
@@ -37,7 +46,9 @@ class TwitchBot():
         self.token_scopes = self.default_scopes
 
         self.user_id = user_id
+        self.user_name = None
         self.broadcaster_id = broadcaster_id
+        self.broadcaster_name = None
         
         self.browser_path = browser_path
         self.port = port
@@ -55,6 +66,7 @@ class TwitchBot():
             scopes=["moderator:read:followers"],
         )
 
+        self.audio = AudioSubscription()
 
     def generate_access_token(self):
         active_scopes = set(self.default_scopes)
@@ -201,12 +213,11 @@ class TwitchBot():
         if response.status_code != 200:
             raise ValueError(f"Send message request failed for {message} with status {response.status_code}")
 
-    def username_to_id(self, username):
+    def id_to_username(self, user_id):
         """
         https://dev.twitch.tv/docs/api/reference/#get-users
         """
-
-        url = f"https://api.twitch.tv/helix/users?login={username}"
+        url = f"https://api.twitch.tv/helix/users?id={user_id}"
         headers = {
             "Authorization": f"Bearer {self.access_token}",
             "Client-Id": self.client_id
@@ -215,10 +226,10 @@ class TwitchBot():
         if response.status_code == 401:
             raise UnauthorizedError()
         if response.status_code != 200:
-            raise ValueError(f"User ID request failed for {username} with status {response.status_code}")
+            raise ValueError(f"Username request failed for {user_id} with status {response.status_code}")
         response_data = response.json()
-        user_id = response_data["data"][0]["id"]
-        return user_id
+        username = response_data["data"][0]["login"]
+        return username
 
     async def setup_event_subscriptions(self, session_id):
         url = "https://api.twitch.tv/helix/eventsub/subscriptions"
@@ -269,6 +280,23 @@ class TwitchBot():
             async for event in websocket:
                 await self.on_event(event)
 
+    async def grab_audio(self):
+        grabber = TwitchAudioGrabber(
+            twitch_url=f"https://www.twitch.tv/{self.broadcaster_name}",
+            blocking=True,
+            segment_length=self.audio.segment_duration_seconds,
+            rate=self.audio.sample_rate,
+            channels=self.audio.channels,
+            dtype=np.int16
+        )
+        while True:
+            audio = grabber.grab()
+            if audio is None:
+                continue
+            for listener in self.audio.listeners:
+                asyncio.create_task(listener(audio))
+            await asyncio.sleep(self.audio.segment_duration_seconds)
+
 
     def update_access_token(self):
         print("Access token failed, attempting to update...")
@@ -284,11 +312,18 @@ class TwitchBot():
 
     async def run_async(self):
         tasks = []
-        tasks.append(asyncio.create_task(self.run_event_listener()))
         while True:
             try:
                 self.valid_access_token(self.access_token)
                 print("Got a valid access token, running bot...")
+                for subscription in self.__dict__.values():
+                    if isinstance(subscription, EventSubscription) and subscription.listeners:
+                        tasks.append(asyncio.create_task(self.run_event_listener()))
+                        break
+                if self.audio.listeners:
+                    if not self.broadcaster_name:
+                        self.broadcaster_name = self.id_to_username(self.broadcaster_id)
+                    tasks.append(asyncio.create_task(self.grab_audio()))
                 await asyncio.gather(*tasks)
             except UnauthorizedError:
                 self.update_access_token()
