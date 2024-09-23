@@ -35,7 +35,7 @@ class AudioSubscription:
         self.listeners = []
 
 class TwitchBot():
-    def __init__(self, user_id:str, broadcaster_id:str, browser_path=None, port=3000):
+    def __init__(self, user_id:str, broadcaster_id:str, browser_path=None, port=3000, prefix="🤖"):
         self.default_scopes = [
             "user:write:chat",
         ]
@@ -52,6 +52,7 @@ class TwitchBot():
         
         self.browser_path = browser_path
         self.port = port
+        self.prefix = prefix
 
         self.channel_chat_message = EventSubscription(
             name="channel.chat.message",
@@ -205,7 +206,7 @@ class TwitchBot():
         data = {
             "broadcaster_id": self.broadcaster_id,
             "sender_id": self.user_id,
-            "message": message
+            "message": f"{self.prefix} {message}"
         }
         response = requests.post(url, headers=headers, json=data)
         if response.status_code == 401:
