@@ -49,7 +49,8 @@ class TwitchBot():
         self.user_name = None
         self.broadcaster_id = broadcaster_id
         self.broadcaster_name = None
-        
+        self.is_live = asyncio.Event()
+
         self.browser_path = browser_path
         self.port = port
         self.prefix = prefix
@@ -67,7 +68,30 @@ class TwitchBot():
             scopes=["moderator:read:followers"],
         )
 
+        self.stream_offline = EventSubscription(
+            name="stream.offline",
+            version="1",
+            conditions={"broadcaster_user_id": self.broadcaster_id},
+            scopes=["user:bot"],
+        )
+
+        self.stream_online = EventSubscription(
+            name="stream.online",
+            version="1",
+            conditions={"broadcaster_user_id": self.broadcaster_id},
+            scopes=["user:bot"],
+        )
+
         self.audio = AudioSubscription()
+
+        self.stream_offline.listeners.append(self._stream_offline_callback)
+        self.stream_online.listeners.append(self._stream_online_callback)
+    
+    async def _stream_online_callback(self, event):
+        self.is_live.set()
+
+    async def _stream_offline_callback(self, event):
+        self.is_live.clear()
 
     def generate_access_token(self):
         active_scopes = set(self.default_scopes)
@@ -282,22 +306,40 @@ class TwitchBot():
                 await self.on_event(event)
 
     async def grab_audio(self):
+        """
+        Grabs stream audio and sends to all audio listeners
+
+        Using twitchrealtimehandler https://pypi.org/project/twitchrealtimehandler/  
+        Which requires a new instance of TwitchAudioGrabber to be created every time stream goes live
+        """
+        if not self.is_live.is_set():
+            await self.is_live.wait()
         grabber = TwitchAudioGrabber(
             twitch_url=f"https://www.twitch.tv/{self.broadcaster_name}",
-            blocking=True,
+            blocking=False,
             segment_length=self.audio.segment_duration_seconds,
             rate=self.audio.sample_rate,
             channels=self.audio.channels,
             dtype=np.int16
         )
         while True:
+            if not self.is_live.is_set():
+                await self.is_live.wait()
+                grabber = TwitchAudioGrabber(
+                    twitch_url=f"https://www.twitch.tv/{self.broadcaster_name}",
+                    blocking=False,
+                    segment_length=self.audio.segment_duration_seconds,
+                    rate=self.audio.sample_rate,
+                    channels=self.audio.channels,
+                    dtype=np.int16
+                )
             audio = grabber.grab()
             if audio is None:
+                await asyncio.sleep(self.audio.segment_duration_seconds)
                 continue
             for listener in self.audio.listeners:
                 asyncio.create_task(listener(audio))
             await asyncio.sleep(self.audio.segment_duration_seconds)
-
 
     def update_access_token(self):
         print("Access token failed, attempting to update...")
@@ -311,11 +353,38 @@ class TwitchBot():
             except:
                 raise ValueError("Failed to generate valid access token")
 
+    def check_online(self):
+        """
+        check whether the broadcaster is currently live using  
+        https://dev.twitch.tv/docs/api/reference/#get-streams
+
+        updates self.is_live Event
+        """
+        url = "https://api.twitch.tv/helix/streams"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Client-Id": self.client_id,
+        }
+        params = {
+            "user_id": self.broadcaster_id
+        }
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 401 or response.status_code == 403:
+            raise UnauthorizedError()
+        if response.status_code != 200:
+            raise ValueError(f"Initial online check failed with status code {response.status_code}")
+        response_data = response.json()
+        if response_data["data"]:
+            self.is_live.set()
+        else:
+            self.is_live.clear()
+
     async def run_async(self):
         tasks = []
         while True:
             try:
                 self.valid_access_token(self.access_token)
+                self.check_online()
                 print("Got a valid access token, running bot...")
                 for subscription in self.__dict__.values():
                     if isinstance(subscription, EventSubscription) and subscription.listeners:
