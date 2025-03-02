@@ -306,22 +306,34 @@ class TwitchBot():
                 await self.on_event(event)
 
     async def grab_audio(self):
+        if not self.is_live.is_set():
+            await self.is_live.wait()
         grabber = TwitchAudioGrabber(
             twitch_url=f"https://www.twitch.tv/{self.broadcaster_name}",
-            blocking=True,
+            blocking=False,
             segment_length=self.audio.segment_duration_seconds,
             rate=self.audio.sample_rate,
             channels=self.audio.channels,
             dtype=np.int16
         )
         while True:
+            if not self.is_live.is_set():
+                await self.is_live.wait()
+                grabber = TwitchAudioGrabber(
+                    twitch_url=f"https://www.twitch.tv/{self.broadcaster_name}",
+                    blocking=False,
+                    segment_length=self.audio.segment_duration_seconds,
+                    rate=self.audio.sample_rate,
+                    channels=self.audio.channels,
+                    dtype=np.int16
+                )
             audio = grabber.grab()
             if audio is None:
+                await asyncio.sleep(self.audio.segment_duration_seconds)
                 continue
             for listener in self.audio.listeners:
                 asyncio.create_task(listener(audio))
             await asyncio.sleep(self.audio.segment_duration_seconds)
-
 
     def update_access_token(self):
         print("Access token failed, attempting to update...")
