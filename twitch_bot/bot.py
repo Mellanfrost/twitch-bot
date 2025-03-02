@@ -49,7 +49,8 @@ class TwitchBot():
         self.user_name = None
         self.broadcaster_id = broadcaster_id
         self.broadcaster_name = None
-        
+        self.is_live = asyncio.Event()
+
         self.browser_path = browser_path
         self.port = port
         self.prefix = prefix
@@ -67,7 +68,30 @@ class TwitchBot():
             scopes=["moderator:read:followers"],
         )
 
+        self.stream_offline = EventSubscription(
+            name="stream.offline",
+            version="1",
+            conditions={"broadcaster_user_id": self.broadcaster_id},
+            scopes=["user:bot"],
+        )
+
+        self.stream_online = EventSubscription(
+            name="stream.online",
+            version="1",
+            conditions={"broadcaster_user_id": self.broadcaster_id},
+            scopes=["user:bot"],
+        )
+
         self.audio = AudioSubscription()
+
+        self.stream_offline.listeners.append(self._stream_offline_callback)
+        self.stream_online.listeners.append(self._stream_online_callback)
+    
+    async def _stream_online_callback(self, event):
+        self.is_live.set()
+
+    async def _stream_offline_callback(self, event):
+        self.is_live.clear()
 
     def generate_access_token(self):
         active_scopes = set(self.default_scopes)
