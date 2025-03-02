@@ -306,6 +306,12 @@ class TwitchBot():
                 await self.on_event(event)
 
     async def grab_audio(self):
+        """
+        Grabs stream audio and sends to all audio listeners
+
+        Using twitchrealtimehandler https://pypi.org/project/twitchrealtimehandler/  
+        Which requires a new instance of TwitchAudioGrabber to be created every time stream goes live
+        """
         if not self.is_live.is_set():
             await self.is_live.wait()
         grabber = TwitchAudioGrabber(
