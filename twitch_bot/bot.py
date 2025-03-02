@@ -335,11 +335,38 @@ class TwitchBot():
             except:
                 raise ValueError("Failed to generate valid access token")
 
+    def check_online(self):
+        """
+        check whether the broadcaster is currently live using  
+        https://dev.twitch.tv/docs/api/reference/#get-streams
+
+        updates self.is_live Event
+        """
+        url = "https://api.twitch.tv/helix/streams"
+        headers = {
+            "Authorization": f"Bearer {self.access_token}",
+            "Client-Id": self.client_id,
+        }
+        params = {
+            "user_id": self.broadcaster_id
+        }
+        response = requests.get(url, headers=headers, params=params)
+        if response.status_code == 401 or response.status_code == 403:
+            raise UnauthorizedError()
+        if response.status_code != 200:
+            raise ValueError(f"Initial online check failed with status code {response.status_code}")
+        response_data = response.json()
+        if response_data["data"]:
+            self.is_live.set()
+        else:
+            self.is_live.clear()
+
     async def run_async(self):
         tasks = []
         while True:
             try:
                 self.valid_access_token(self.access_token)
+                self.check_online()
                 print("Got a valid access token, running bot...")
                 for subscription in self.__dict__.values():
                     if isinstance(subscription, EventSubscription) and subscription.listeners:
