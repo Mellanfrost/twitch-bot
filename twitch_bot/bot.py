@@ -320,7 +320,7 @@ class TwitchBot():
             segment_length=self.audio.segment_duration_seconds,
             rate=self.audio.sample_rate,
             channels=self.audio.channels,
-            dtype=np.int16
+            dtype=np.float32
         )
         while True:
             if not self.is_live.is_set():
@@ -331,7 +331,7 @@ class TwitchBot():
                     segment_length=self.audio.segment_duration_seconds,
                     rate=self.audio.sample_rate,
                     channels=self.audio.channels,
-                    dtype=np.int16
+                    dtype=np.float32
                 )
             audio = grabber.grab()
             if audio is None:
