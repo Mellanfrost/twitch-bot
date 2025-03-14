@@ -1,406 +1,105 @@
-import asyncio
 import json
-import os
-import secrets
-import urllib.parse
-import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import asyncio
 
-import dotenv
-import numpy as np
-import requests
 import websockets
-from twitchrealtimehandler import TwitchAudioGrabber
 
-dotenv.load_dotenv(override=True)
-
-
-class UnauthorizedError(Exception):
-    """Error for 401 status code on requests -> access token is either expired, does not have the correct scopes, or is invalid"""
-    pass
-
-class EventSubscription:
-    def __init__(self, name, version, conditions, scopes):
-        self.name = name
-        self.version = version
-        self.conditions = conditions
-        self.scopes = scopes
-        self.listeners = []
-
-class AudioSubscription:
-    def __init__(self, segment_duration_seconds=1, sample_rate=44100, channels=1):
-        self.segment_duration_seconds = segment_duration_seconds
-        self.sample_rate = sample_rate
-        self.channels = channels
-        self.listeners = []
+import twitch_bot.api as api
+from twitch_bot.audio import AudioSubscription
+from twitch_bot.events import EventSubscriptions
+from twitch_bot.auth import TwitchAuthManager
 
 class TwitchBot():
-    def __init__(self, user_id:str, broadcaster_id:str, browser_path=None, port=3000, prefix="🤖"):
-        self.default_scopes = [
-            "user:write:chat",
-        ]
-        self.client_id = os.getenv("CLIENT_ID")
-        self.client_secret = os.getenv("CLIENT_SECRET")
-        self.access_token = os.getenv("ACCESS_TOKEN") # = None if not set -> will be generated when running bot
-        self.refresh_token = os.getenv("REFRESH_TOKEN")
-        self.token_scopes = self.default_scopes
+    def __init__(
+        self,
+        auth:TwitchAuthManager,
+        user_name:str,
+        broadcaster_name:str,
+        user_id:str=None,
+        broadcaster_id:str=None,
+        bot_chat_prefix:str="🤖",
+    ):
+        self.auth = auth
+        self.user_name = user_name
+        self.broadcaster_name = broadcaster_name
+        self.bot_chat_prefix = bot_chat_prefix
 
-        self.user_id = user_id
-        self.user_name = None
-        self.broadcaster_id = broadcaster_id
-        self.broadcaster_name = None
+        # get IDs if not provided
+        if user_id is None or broadcaster_id is None:
+            auth.ensure_valid_tokens() # need valid access token to get IDs
+        if user_id:
+            self.user_id = user_id
+        else:
+            response = api.get_users(self.auth.client_id, self.auth.access_token, id=f"login={user_name}")
+            self.user_id = response.json()["data"][0]["id"]
+        if broadcaster_id:
+            self.broadcaster_id = broadcaster_id
+        else:
+            response = api.get_users(self.auth.client_id, self.auth.access_token, id=f"login={broadcaster_name}")
+            self.broadcaster_id = response.json()["data"][0]["id"]
+
+        self.audio = AudioSubscription(self.broadcaster_name)
+        self.events = EventSubscriptions(
+            self.broadcaster_id,
+            self.user_id,
+            self.auth.client_id,
+        )
         self.is_live = asyncio.Event()
+        self.events.stream_online.add_callback(lambda event: self.is_live.set())
+        self.events.stream_offline.add_callback(lambda event: self.is_live.clear())
 
-        self.browser_path = browser_path
-        self.port = port
-        self.prefix = prefix
+    def send_chat_message(self, message):
+        message_with_prefix = f"{self.bot_chat_prefix} {message}" if self.bot_chat_prefix else message
+        api.send_chat_message(self.user_id, self.broadcaster_id, self.auth.client_id, self.auth.access_token, message_with_prefix)
 
-        self.channel_chat_message = EventSubscription(
-            name="channel.chat.message",
-            version="1",
-            conditions={"broadcaster_user_id": self.broadcaster_id, "user_id": self.user_id},
-            scopes=["user:read:chat", "user:bot", "channel:bot"],
-        )
-        self.channel_follow = EventSubscription(
-            name="channel.follow",
-            version="2",
-            conditions={"broadcaster_user_id": self.broadcaster_id, "moderator_user_id": self.user_id},
-            scopes=["moderator:read:followers"],
-        )
+    def run(self):
+        required_scopes = set(scope for event in self.events if event.callbacks for scope in event.scopes)
+        self.auth.required_scopes = required_scopes
+        self.auth.ensure_valid_tokens()
 
-        self.stream_offline = EventSubscription(
-            name="stream.offline",
-            version="1",
-            conditions={"broadcaster_user_id": self.broadcaster_id},
-            scopes=["user:bot"],
-        )
+        response = api.get_streams(self.broadcaster_id, self.auth.client_id, self.auth.access_token)
+        live_data = response.json()["data"]
+        self.is_live.set() if live_data else self.is_live.clear()
 
-        self.stream_online = EventSubscription(
-            name="stream.online",
-            version="1",
-            conditions={"broadcaster_user_id": self.broadcaster_id},
-            scopes=["user:bot"],
-        )
-
-        self.audio = AudioSubscription()
-
-        self.stream_offline.listeners.append(self._stream_offline_callback)
-        self.stream_online.listeners.append(self._stream_online_callback)
-    
-    async def _stream_online_callback(self, event):
-        self.is_live.set()
-
-    async def _stream_offline_callback(self, event):
-        self.is_live.clear()
-
-    def generate_access_token(self):
-        active_scopes = set(self.default_scopes)
-        for subscription in self.__dict__.values():
-            if not isinstance(subscription, EventSubscription):
-                continue
-            if not subscription.listeners:
-                continue
-            active_scopes.update(subscription.scopes)
-        scope = " ".join(active_scopes)
-        expected_state = secrets.token_urlsafe(32)
-        authorization_url = (
-            f"https://id.twitch.tv/oauth2/authorize"
-            f"?response_type=code"
-            f"&client_id={self.client_id}"
-            f"&redirect_uri=http://localhost:{self.port}"
-            f"&scope={scope}"
-            f"&state={expected_state}"
-        )
-
-        class TwitchRedirectHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                self.send_response(200)
-                self.send_header("Content-type", "text/html")
-                self.end_headers()
-                parsed_url = urllib.parse.urlparse(self.path)
-                query_params = urllib.parse.parse_qs(parsed_url.query)
-
-                state = query_params.get("state", [None])[0]
-                if state != expected_state:
-                    raise ValueError("Invalid state parameter - does not match original state")
-
-                code = query_params.get("code", [None])[0]
-                self.server.code = code
-
-        server_address = ("", self.port)
-        httpd = HTTPServer(server_address, TwitchRedirectHandler)
-        if self.browser_path:
-            webbrowser.register("specified_browser", None, webbrowser.BackgroundBrowser(self.browser_path))
-            webbrowser.get("specified_browser").open(authorization_url)
-        else:
-            webbrowser.open(authorization_url)
-        httpd.handle_request()
-        code = httpd.code
-
-        token_url = "https://id.twitch.tv/oauth2/token"
-        payload = {
-            "client_id": self.client_id,
-            "client_secret": self.client_secret,
-            "code": code,
-            "grant_type": "authorization_code",
-            "redirect_uri": f"http://localhost:{self.port}"
-        }
-        response = requests.post(token_url, data=payload)
-        if response.status_code == 401:
-            raise UnauthorizedError()
-        response_data = response.json()
-        access_token = response_data.get("access_token")
-        refresh_token = response_data.get("refresh_token")
-        token_scopes = response_data["scope"]
-
-        self.valid_access_token(access_token)
-        
-        dotenv_path = dotenv.find_dotenv()
-        dotenv.set_key(dotenv_path, "ACCESS_TOKEN", access_token)
-        dotenv.set_key(dotenv_path, "REFRESH_TOKEN", refresh_token)
-
-        self.access_token = access_token
-        self.refresh_token = refresh_token
-        self.token_scopes = token_scopes
-
-    def refresh_access_token(self):
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-        data = {
-            "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token,
-            "client_id": self.client_id,
-            "client_secret": self.client_secret
-        }
-        response = requests.post("https://id.twitch.tv/oauth2/token", headers=headers, data=data)
-        if response.status_code == 401:
-            raise UnauthorizedError()
-        elif response.status_code != 200:
-            raise ValueError()
-        response_data = response.json()
-        access_token = response_data.get("access_token")
-        refresh_token = response_data.get("refresh_token")
-        token_scopes = response_data["scope"]
-
-        self.valid_access_token(access_token)
-        
-        dotenv_path = dotenv.find_dotenv()
-        dotenv.set_key(dotenv_path, "ACCESS_TOKEN", access_token)
-        dotenv.set_key(dotenv_path, "REFRESH_TOKEN", refresh_token)
-
-        self.access_token = access_token
-        self.refresh_token = refresh_token
-        self.token_scopes = token_scopes
-
-    def valid_access_token(self, access_token):
-        headers = {"Authorization": f"OAuth {access_token}"}
-        response = requests.get("https://id.twitch.tv/oauth2/validate", headers=headers)
-        if response.status_code == 401:
-            raise UnauthorizedError()
-        if response.status_code != 200:
-            raise ValueError()
-        response_data = response.json()
-        token_scopes = response_data["scopes"]
-        required_scopes = set(self.default_scopes)
-        for subscription in self.__dict__.values():
-            if not isinstance(subscription, EventSubscription):
-                continue
-            if not subscription.listeners:
-                continue
-            required_scopes.update(subscription.scopes)
-        for scope in required_scopes:
-            if scope not in token_scopes:
-                raise UnauthorizedError("Token scopes does not match required scopes")
-        if token_scopes != self.token_scopes:
-            self.token_scopes = token_scopes
-            print("Updated token scopes")
-
-    async def send_message(self, message):
-        """
-        https://dev.twitch.tv/docs/api/reference/#send-chat-message
-        """
-
-        url = "https://api.twitch.tv/helix/chat/messages"
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Client-Id": self.client_id,
-            "Content-Type": "application/json"
-        }
-        data = {
-            "broadcaster_id": self.broadcaster_id,
-            "sender_id": self.user_id,
-            "message": f"{self.prefix} {message}"
-        }
-        response = requests.post(url, headers=headers, json=data)
-        if response.status_code == 401:
-            raise UnauthorizedError()
-        if response.status_code != 200:
-            raise ValueError(f"Send message request failed for {message} with status {response.status_code}")
-
-    def id_to_username(self, user_id):
-        """
-        https://dev.twitch.tv/docs/api/reference/#get-users
-        """
-        url = f"https://api.twitch.tv/helix/users?id={user_id}"
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Client-Id": self.client_id
-        }
-        response = requests.get(url, headers=headers)
-        if response.status_code == 401:
-            raise UnauthorizedError()
-        if response.status_code != 200:
-            raise ValueError(f"Username request failed for {user_id} with status {response.status_code}")
-        response_data = response.json()
-        username = response_data["data"][0]["login"]
-        return username
-
-    async def setup_event_subscriptions(self, session_id):
-        url = "https://api.twitch.tv/helix/eventsub/subscriptions"
-        headers = {
-            "Authorization": f"Bearer {self.access_token}", 
-            "Client-Id": self.client_id, 
-            "Content-Type": "application/json",
-            "Accept": "application/vnd.twitchtv.v5+json"
-        }
-        for subscription in self.__dict__.values():
-            if not isinstance(subscription, EventSubscription):
-                continue
-            if not subscription.listeners:
-                continue
-            subscription_data = {
-                "type": subscription.name,
-                "version": subscription.version,
-                "condition": subscription.conditions,
-                "transport": {
-                    "method": "websocket",
-                    "session_id": session_id,
-                }
-            }
-            response = requests.post(url, headers=headers, json=subscription_data)
-            if response.status_code == 401:
-                raise UnauthorizedError()
-            if response.status_code != 202:
-                raise ValueError(f"Subscription request failed for {subscription.name} with status {response.status_code}")
-
-    async def on_event(self, event_str):
-        event = json.loads(event_str)
-        event_type = event["metadata"]["message_type"]
-        if event_type == "session_welcome":
-            session_id = event["payload"]["session"]["id"]
-            await self.setup_event_subscriptions(session_id)
-        elif event_type == "notification":
-            notification_type = event["payload"]["subscription"]["type"].replace(".", "_")
-            event_listener = getattr(self, notification_type, None)
-            for listener in event_listener.listeners:
-                asyncio.create_task(listener(event))
-        elif event_type == "session_keepalive":
-            pass
-        else:
-            print(f"Unhandled event:\n{event}")
-
-    async def run_event_listener(self):
-        async with websockets.connect("wss://eventsub.wss.twitch.tv/ws") as websocket:
-            async for event in websocket:
-                await self.on_event(event)
-
-    async def grab_audio(self):
-        """
-        Grabs stream audio and sends to all audio listeners  
-        Audio in the shape of [samples, channels]
-
-        Using twitchrealtimehandler https://pypi.org/project/twitchrealtimehandler/  
-        Which requires a new instance of TwitchAudioGrabber to be created every time stream goes live  
-        """
-        if not self.is_live.is_set():
-            await self.is_live.wait()
-        grabber = TwitchAudioGrabber(
-            twitch_url=f"https://www.twitch.tv/{self.broadcaster_name}",
-            blocking=False,
-            segment_length=self.audio.segment_duration_seconds,
-            rate=self.audio.sample_rate,
-            channels=self.audio.channels,
-            dtype=np.float32
-        )
-        while True:
-            if not self.is_live.is_set():
-                await self.is_live.wait()
-                grabber = TwitchAudioGrabber(
-                    twitch_url=f"https://www.twitch.tv/{self.broadcaster_name}",
-                    blocking=False,
-                    segment_length=self.audio.segment_duration_seconds,
-                    rate=self.audio.sample_rate,
-                    channels=self.audio.channels,
-                    dtype=np.float32
-                )
-            audio = grabber.grab()
-            if audio is None:
-                await asyncio.sleep(self.audio.segment_duration_seconds)
-                continue
-            for listener in self.audio.listeners:
-                asyncio.create_task(listener(audio))
-            await asyncio.sleep(self.audio.segment_duration_seconds)
-
-    def update_access_token(self):
-        print("Access token failed, attempting to update...")
-        try:
-            self.refresh_access_token()
-            print("Refreshed access token")
-        except:
-            try:
-                self.generate_access_token()
-                print("Generated new access token")
-            except:
-                raise ValueError("Failed to generate valid access token")
-
-    def check_online(self):
-        """
-        check whether the broadcaster is currently live using  
-        https://dev.twitch.tv/docs/api/reference/#get-streams
-
-        updates self.is_live Event
-        """
-        url = "https://api.twitch.tv/helix/streams"
-        headers = {
-            "Authorization": f"Bearer {self.access_token}",
-            "Client-Id": self.client_id,
-        }
-        params = {
-            "user_id": self.broadcaster_id
-        }
-        response = requests.get(url, headers=headers, params=params)
-        if response.status_code == 401 or response.status_code == 403:
-            raise UnauthorizedError()
-        if response.status_code != 200:
-            raise ValueError(f"Initial online check failed with status code {response.status_code}")
-        response_data = response.json()
-        if response_data["data"]:
-            self.is_live.set()
-        else:
-            self.is_live.clear()
+        asyncio.run(self.run_async())
 
     async def run_async(self):
         tasks = []
-        while True:
-            try:
-                self.valid_access_token(self.access_token)
-                self.check_online()
-                print("Got a valid access token, running bot...")
-                for subscription in self.__dict__.values():
-                    if isinstance(subscription, EventSubscription) and subscription.listeners:
-                        tasks.append(asyncio.create_task(self.run_event_listener()))
-                        break
-                if self.audio.listeners:
-                    if not self.broadcaster_name:
-                        self.broadcaster_name = self.id_to_username(self.broadcaster_id)
-                    tasks.append(asyncio.create_task(self.grab_audio()))
-                await asyncio.gather(*tasks)
-            except UnauthorizedError:
-                self.update_access_token()
-            except asyncio.CancelledError:
-                print("Exited")
-                break
+        tasks.append(asyncio.create_task(self.auth.keep_alive()))
+        tasks.append(asyncio.create_task(self.run_websocket_events()))
+        if self.audio.callbacks:
+            tasks.append(asyncio.create_task(self.audio.run(self.is_live)))
 
-    def run(self):
-        asyncio.run(self.run_async())
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            print("Exited")
+            return
+
+    async def run_websocket_events(self):
+        """https://dev.twitch.tv/docs/eventsub/handling-websocket-events/"""
+        async with websockets.connect("wss://eventsub.wss.twitch.tv/ws") as websocket:
+
+            # session welcome
+            welcome_msg = await websocket.recv()
+            data = json.loads(welcome_msg)
+            message_type = data["metadata"]["message_type"]
+            if message_type != "session_welcome":
+                raise Exception("Did not recieve session welcome message")
+            self.session_id = data["payload"]["session"]["id"]
+
+            # set up event subscriptions
+            for event in self.events:
+                if event.callbacks:
+                    event.setup(self.auth.client_id, self.auth.access_token, self.session_id)
+
+            # handle events
+            async for msg in websocket:
+                data = json.loads(msg)
+                message_type = data["metadata"]["message_type"]
+                if message_type == "notification":
+                    event_type = data["payload"]["subscription"]["type"]
+                    event_handler = self.events[event_type]
+                    if not event_handler:
+                        raise Exception("No handler for event")
+                    event_data = data["payload"]["event"]
+                    event_handler.trigger_callbacks(event_data)
