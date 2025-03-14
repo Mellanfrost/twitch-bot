@@ -51,7 +51,7 @@ class EventSubscriptions:
             version = "2",
             condition = {
                 "broadcaster_user_id": broadcaster_id,
-                "user_id": user_id,
+                "moderator_user_id": user_id,
             },
             scopes = ["moderator:read:followers"],
         )
