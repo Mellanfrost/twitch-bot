@@ -1,99 +1,134 @@
-# twitch-bot
+# Twitch Bot Library
 
-Twitch bot software designed to be as easy as possible to implement custom functionality for  
-Handles setting up and refreshing tokens, subscribing to twitch events, and in a modular way sending events to any custom actions implemented  
+A Python library for building and managing Twitch bots with ease. This library provides an interface for connecting to Twitch's EventSub via WebSocket and interacting with Twitch's API. It simplifies the process of creating custom Twitch bots by allowing you to focus on implementing your own custom functionality.
 
-Use your own bot application and run it through this software  
+### ⚠️ Project Status: Early Work in Progress (WIP) ⚠️  
+This project is currently in its early stages of development. Not all features are fully implemented. Use it at your own risk and expect frequent breaking changes. Feel free to reach out to provide feedback and to help shape its future!
 
-## Contents
-
-- [Installation](#installation)
-- [How to Use](#how-to-use)
-- [Implementation Examples](#implementation-examples)
+## Features
+- **EventSub Integration:** Automatically subscribes to specified EventSub events using WebSockets.
+- **Twitch API Interface:** Built-in support for calling Twitch API endpoints.
+- **Authentication Management:** Handles OAuth token refreshing and validation, ensuring you always have valid tokens.
+- **Custom Event Handlers:** Easily add your own custom functions to handle specific events.
 
 ## Installation
-
-Install from requirements.txt  
-
-Register your application here https://dev.twitch.tv/console  
-This is how you get your own bot client_id and client_secret which are required for running a twitch bot  
-Either do it using your own account (the bot will have your username), or set up a separate twitch account for the bot  
-
-Create an .env file containing the following:  
-```python
-# from the dev console where you first registered your application:
-CLIENT_ID="" # id of your application
-CLIENT_SECRET="" # secret of your application
-
-# optional: can be filled in manually, else  generated automatically when running the bot
-# will open browser and prompt to manually accept scopes any time a token with new scopes is generated
-# once added, the bot will automatically handle refreshing these tokens
-ACCESS_TOKEN="" # optional
-REFRESH_TOKEN="" # optional
+You can install the library via pip:
 ```
-Be very careful not to leak these to anyone else!
+pip install git+https://github.com/Mellanfrost/twitch-bot.git
+```
 
-## How to Use
-
-### 1. Initialize TwitchBot
-
+## Running the Bot
+To get started, initialize a bot instance, add any custom event handlers, and run the bot:
 ```python
-from bot import TwitchBot
+from twitch_bot import TwitchBot, TwitchAuthManager
+
+auth_manager = TwitchAuthManager(
+    client_id = "your-client-id",
+    client_secret = "your-client-secret",
+)
+
 bot = TwitchBot(
-    user_id="id of bot account",
-    broadcaster_id="id of channel to run in",
-    browser_path, # optional, defaults to default browser
-    port, # optional, defaults to 3000
+    auth = auth_manager,
+    user_name = "your-bot-name",
+    broadcaster_name = "streamer-name",
+)
+
+# add any custom event handlers to the bot instance here
+
+bot.run()
+```
+By default, the bot will attempt to save and load access and refresh tokens as `ACCESS_TOKEN` and `REFRESH_TOKEN` to/from a `.env` file.
+
+To change this behaviour, implement a custom version of `TokenStorage`:
+```python
+from twitch_bot.token_storage import AbstractTokenStorage
+
+class MyTokenStorage(AbstractTokenStorage):
+    def save_tokens(self, access_token, refresh_token):
+        # your custom logic to save tokens
+        pass
+
+    def load_tokens(self):
+        # your custom logic to load tokens
+        pass
+
+auth = TwitchAuthManager(
+    client_id = "your-client-id",
+    client_secret = "your-client-secret",
+    token_storage = MyTokenStorage(),
 )
 ```
 
-### 2. Add Actions 
+## Adding Event Handlers
+This is where you add your own bot features!
 
-Specify which events to subscribe to and what happens when they occur  
-For available events and what their notification payload, see https://dev.twitch.tv/docs/eventsub/eventsub-subscription-types/  
-The entire notification payload is sent to listeners as a dict  
+To see which events exist and what they return, see Twitch's documentation:  
+https://dev.twitch.tv/docs/eventsub/eventsub-subscription-types
 
-Example:  
-Run `my_func` every time someone types a message in the broadcaster's channel  
+See a few example implementations below:
+
+### 1. Thank Followers
+Create a function to send a thank-you message triggered on the `channel_follow` event:
 ```python
-bot.channel_chat_message.listeners.append(my_func) # event named channel.chat.message -> channel_chat_message
+def thank_follower(event):
+    bot.send_chat_message(f"Thank you for following, {event["user_name"]}!")
+
+bot.events.channel_follow.add_callback(thank_follower)
+```
+To explicitly pass the bot instance, use a lambda function:
+```python
+def thank_follower(event, bot:TwitchBot):
+    bot.send_chat_message(f"Thank you for following, {event["user_name"]}!")
+
+bot.events.channel_follow.add_callback(lambda event: thank_follower(event, bot))
 ```
 
-### 3. Run Bot 
+### 2. Reply to Commands
+```python
+def reply_to_commands(event):
+    # avoid replying to its own commands
+    if event["chatter_user_login"] == bot.user_name:
+        return
 
-```python 
-bot.run()
+    message = event["message"]["text"]
+    if message.startswith("!ping"):
+        bot.send_chat_message("pong")
 ```
 
-Sets up everything required to run (auth token, scopes, subscription to events)  
-Runs asynchronously until stopped (handles refreshing tokens automatically)  
-
-Whenever a subscribed event occurs, the event message is sent to all listeners of that event  
-
-## Implementation Examples
-
-A bot that will thank followers in twitch chat and print follows in your terminal
-
+### 3. Stream Live Notification
+Do something on stream start/end, for example notifying people on Discord:
 ```python
-bot = TwitchBot(user_id="my_id", broadcaster_id="channel_id")
+def notify_discord_online(event):
+    your_send_to_discord_func("Stream is now live!") # your own implemented discord API logic
 
-# implement your own functionality, this can be anything you want
-async def print_follows(event):
-    """Print f"{username} followed" in terminal when someone follows"""
-    print(f"\n{event["payload"]["event"]["user_name"]} followed")
+bot.event.stream_online.add_listener(notify_discord_online)    
+```
 
-# add the functionality to the bot
-bot.channel_follow.listeners.append(print_follows)
+### 4. Process Stream Audio
+Access stream audio, for example for passing to a Speech-to-Text (STT) model for subtitles:
+```python
+def speech_to_text(audio):
+    your_stt_func(audio) # send audio through your own STT pipeline
 
+bot.audio.add_callback(speech_to_text)
 
-# this function requires an additional parameter, callback, to send its output elsewhere
-async def thank_follower(event, callback):
-    """Send f"Thank you for the follow {username}!" in twitch chat when someone follows"""
-    username = event["payload"]["event"]["user_name"]
-    await callback(f"Thank you for the follow {username}!")
+# optionally, specify properties of audio to grab
+bot.audio.segment_duration_seconds = 4
+```
 
-# additional parameters can be passed by appending a lambda function to listeners like so
-bot.channel_follow.listeners.append(lambda event: thank_follower(event, bot.send_message))
+## Access Twitch API Endpoints
+To see which API endpoints exist and how they work, see Twitch's documentation:  
+https://dev.twitch.tv/docs/api/reference
 
-bot.run()
+This library provides interfaces to several of Twitch's API endpoints, which can be used as follows:
+```python
+from twitch_bot import api
+
+api.send_chat_message(
+    bot.user_id,
+    bot.broadcaster_id,
+    bot.auth.client_id,
+    bot.auth.access_token,
+    "your message",
+)
 ```
