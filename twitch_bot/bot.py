@@ -1,12 +1,10 @@
-import json
 import asyncio
-
-import websockets
 
 import twitch_bot.api as api
 from twitch_bot.audio import AudioSubscription
-from twitch_bot.events import EventSubscriptions
 from twitch_bot.auth import TwitchAuthManager
+from twitch_bot.events import EventSubscriptions
+from twitch_bot.websocket_handler import WebsocketHandler
 
 class TwitchBot():
     def __init__(
@@ -65,7 +63,8 @@ class TwitchBot():
     async def run_async(self):
         tasks = []
         tasks.append(asyncio.create_task(self.auth.keep_alive()))
-        tasks.append(asyncio.create_task(self.run_websocket_events()))
+        ws_handler = WebsocketHandler(self)
+        tasks.append(asyncio.create_task(ws_handler.start()))
         if self.audio.callbacks:
             tasks.append(asyncio.create_task(self.audio.run(self.is_live)))
 
@@ -74,32 +73,3 @@ class TwitchBot():
         except asyncio.CancelledError:
             print("Exited")
             return
-
-    async def run_websocket_events(self):
-        """https://dev.twitch.tv/docs/eventsub/handling-websocket-events/"""
-        async with websockets.connect("wss://eventsub.wss.twitch.tv/ws") as websocket:
-
-            # session welcome
-            welcome_msg = await websocket.recv()
-            data = json.loads(welcome_msg)
-            message_type = data["metadata"]["message_type"]
-            if message_type != "session_welcome":
-                raise Exception("Did not recieve session welcome message")
-            self.session_id = data["payload"]["session"]["id"]
-
-            # set up event subscriptions
-            for event in self.events:
-                if event.callbacks:
-                    event.setup(self.auth.client_id, self.auth.access_token, self.session_id)
-
-            # handle events
-            async for msg in websocket:
-                data = json.loads(msg)
-                message_type = data["metadata"]["message_type"]
-                if message_type == "notification":
-                    event_type = data["payload"]["subscription"]["type"]
-                    event_handler = self.events[event_type]
-                    if not event_handler:
-                        raise Exception("No handler for event")
-                    event_data = data["payload"]["event"]
-                    event_handler.trigger_callbacks(event_data)
